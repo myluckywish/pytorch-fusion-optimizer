@@ -19,8 +19,17 @@ model = TinyModel()
 traced = symbolic_trace(model)
 
 #prints graph
+print("FULL GRAPH:")
 print(traced.graph)
-
+print("\nNODES:")
+for node in traced.graph.nodes:
+    print(
+        "name:", node.name,
+        "| op:", node.op,
+        "| target:", node.target,
+        "| args:", node.args
+    )
+    
 #test it still works
 x = torch.randn(1, 4)
 print(traced(x))
