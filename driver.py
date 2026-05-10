@@ -38,20 +38,14 @@ class Model(nn.Module):
         return x
 
 
-model = Model()
-traced = symbolic_trace(model)
+class FusedLinearReLU(nn.Module):
+    def __init__(self, linear, relu):
+        super().__init__()
+        self.linear = linear
+        self.relu = relu
 
-print("FULL GRAPH:")
-print(traced.graph)
-
-print("\nNODES:")
-for node in traced.graph.nodes:
-    print(
-        "name:", node.name,
-        "| op:", node.op,
-        "| target:", node.target,
-        "| args:", node.args
-    )
+    def forward(self, x):
+        return self.relu(self.linear(x))
 
 
 def is_module_type(node, traced, module_type):
@@ -62,58 +56,75 @@ def is_module_type(node, traced, module_type):
     return isinstance(module, module_type)
 
 
+def fuse_linear_relu(traced):
+    modules = dict(traced.named_modules())
+    graph = traced.graph
+
+    nodes = list(graph.nodes)
+    fusion_count = 0
+
+    for i in range(len(nodes) - 1):
+        linear_node = nodes[i]
+        relu_node = nodes[i + 1]
+
+        if not (
+            is_module_type(linear_node, traced, nn.Linear)
+            and is_module_type(relu_node, traced, nn.ReLU)
+        ):
+            continue
+
+        if relu_node.args[0] != linear_node:
+            continue
+
+        fusion_count += 1
+        fused_name = f"fused_linear_relu_{fusion_count}"
+
+        linear_module = modules[linear_node.target]
+        relu_module = modules[relu_node.target]
+
+        fused_module = FusedLinearReLU(linear_module, relu_module)
+
+        traced.add_module(fused_name, fused_module)
+
+        with graph.inserting_after(relu_node):
+            fused_node = graph.call_module(fused_name, args=linear_node.args)
+
+        relu_node.replace_all_uses_with(fused_node)
+
+        graph.erase_node(relu_node)
+        graph.erase_node(linear_node)
+
+    graph.lint()
+    traced.recompile()
+
+    return traced
+
+
+model = Model()
+traced = symbolic_trace(model)
+
+print("BEFORE GRAPH:")
+print(traced.graph)
+
 x = torch.randn(512, 4)
-print("\nMODEL OUTPUT:")
-print(traced(x))
 
-nodes = list(traced.graph.nodes)
+original_output = traced(x)
 
-print("\nPATTERN MATCHES:")
+fused_traced = fuse_linear_relu(traced)
 
-# 2-node patterns
-for i in range(len(nodes) - 1):
-    a = nodes[i]
-    b = nodes[i + 1]
+print("\nAFTER GRAPH:")
+print(fused_traced.graph)
 
-    if is_module_type(a, traced, nn.Linear) and is_module_type(b, traced, nn.ReLU):
-        print("MATCH FOUND: Linear -> ReLU")
-        print("Possible transformation: fuse Linear + ReLU\n")
+fused_output = fused_traced(x)
 
-    if is_module_type(a, traced, nn.Linear) and is_module_type(b, traced, nn.Sigmoid):
-        print("MATCH FOUND: Linear -> Sigmoid")
-        print("Possible transformation: fuse Linear + Sigmoid\n")
+print("\nOUTPUT SHAPES:")
+print("Original output shape:", original_output.shape)
+print("Fused output shape:   ", fused_output.shape)
 
-    if is_module_type(a, traced, nn.Linear) and is_module_type(b, traced, nn.Dropout):
-        print("MATCH FOUND: Linear -> Dropout")
-        print("Possible transformation: combine compute + regularization pass\n")
+print("\nOUTPUT CHECK:")
+print("Outputs close:", torch.allclose(original_output, fused_output, atol=1e-6))
 
-
-# 3-node patterns
-for i in range(len(nodes) - 2):
-    a = nodes[i]
-    b = nodes[i + 1]
-    c = nodes[i + 2]
-
-    if (
-        is_module_type(a, traced, nn.Linear)
-        and is_module_type(b, traced, nn.BatchNorm1d)
-        and is_module_type(c, traced, nn.ReLU)
-    ):
-        print("MATCH FOUND: Linear -> BatchNorm -> ReLU")
-        print("Possible transformation: fuse Linear + BatchNorm + ReLU\n")
-
-    if (
-        is_module_type(a, traced, nn.Linear)
-        and is_module_type(b, traced, nn.ReLU)
-        and is_module_type(c, traced, nn.Linear)
-    ):
-        print("MATCH FOUND: Linear -> ReLU -> Linear")
-        print("Possible transformation: mark as MLP block\n")
-
-    if (
-        is_module_type(a, traced, nn.Linear)
-        and is_module_type(b, traced, nn.Sigmoid)
-        and is_module_type(c, traced, nn.Linear)
-    ):
-        print("MATCH FOUND: Linear -> Sigmoid -> Linear")
-        print("Possible transformation: activation block rewrite\n")
+print("\nMODULES AFTER FUSION:")
+for name, module in fused_traced.named_modules():
+    if name != "":
+        print(name, "->", module.__class__.__name__)
