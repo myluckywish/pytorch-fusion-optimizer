@@ -1,3 +1,4 @@
+```python
 import torch
 import torch.nn as nn
 from torch.fx import symbolic_trace
@@ -49,6 +50,23 @@ class FusedLinearReLU(nn.Module):
         return self.relu(self.linear(x))
 
 
+class FusedLinearSigmoid(nn.Module):
+    def __init__(self, linear, sigmoid):
+        super().__init__()
+        self.linear = linear
+        self.sigmoid = sigmoid
+
+    def forward(self, x):
+        return self.sigmoid(self.linear(x))
+
+
+class RewriteRule:
+    def __init__(self, name, pattern, replacement):
+        self.name = name
+        self.pattern = pattern
+        self.replacement = replacement
+
+
 def is_module_type(node, traced, module_type):
     if node.op != "call_module":
         return False
@@ -57,48 +75,78 @@ def is_module_type(node, traced, module_type):
     return isinstance(module, module_type)
 
 
-def fuse_linear_relu(traced):
-    modules = dict(traced.named_modules())
-    graph = traced.graph
+def matches_pattern(nodes, start, traced, pattern):
+    if start + len(pattern) > len(nodes):
+        return False
 
-    nodes = list(graph.nodes)
+    for offset, module_type in enumerate(pattern):
+        node = nodes[start + offset]
+
+        if not is_module_type(node, traced, module_type):
+            return False
+
+        if offset > 0:
+            prev_node = nodes[start + offset - 1]
+
+            if node.args[0] != prev_node:
+                return False
+
+    return True
+
+
+def apply_rewrite_rules(traced, rules):
+    graph = traced.graph
     fusion_count = 0
 
-    for i in range(len(nodes) - 1):
-        linear_node = nodes[i]
-        relu_node = nodes[i + 1]
+    changed = True
 
-        if not (
-            is_module_type(linear_node, traced, nn.Linear)
-            and is_module_type(relu_node, traced, nn.ReLU)
-        ):
-            continue
+    while changed:
+        changed = False
+        modules = dict(traced.named_modules())
+        nodes = list(graph.nodes)
 
-        if relu_node.args[0] != linear_node:
-            continue
+        for rule in rules:
+            for i in range(len(nodes)):
+                if not matches_pattern(nodes, i, traced, rule.pattern):
+                    continue
 
-        fusion_count += 1
-        fused_name = f"fused_linear_relu_{fusion_count}"
+                matched_nodes = nodes[i:i + len(rule.pattern)]
+                first_node = matched_nodes[0]
+                last_node = matched_nodes[-1]
 
-        linear_module = modules[linear_node.target]
-        relu_module = modules[relu_node.target]
+                fusion_count += 1
+                fused_name = f"fused_{rule.name}_{fusion_count}"
 
-        fused_module = FusedLinearReLU(linear_module, relu_module)
+                old_modules = [
+                    modules[node.target]
+                    for node in matched_nodes
+                ]
 
-        traced.add_module(fused_name, fused_module)
+                fused_module = rule.replacement(*old_modules)
+                traced.add_module(fused_name, fused_module)
 
-        with graph.inserting_after(relu_node):
-            fused_node = graph.call_module(fused_name, args=linear_node.args)
+                with graph.inserting_after(last_node):
+                    fused_node = graph.call_module(
+                        fused_name,
+                        args=first_node.args
+                    )
 
-        relu_node.replace_all_uses_with(fused_node)
+                last_node.replace_all_uses_with(fused_node)
 
-        graph.erase_node(relu_node)
-        graph.erase_node(linear_node)
+                for node in reversed(matched_nodes):
+                    graph.erase_node(node)
 
-    graph.lint()
-    traced.recompile()
+                graph.lint()
+                traced.recompile()
+
+                changed = True
+                break
+
+            if changed:
+                break
 
     return traced
+
 
 def benchmark(model, x, runs=1000):
     model.eval()
@@ -117,8 +165,23 @@ def benchmark(model, x, runs=1000):
     return (end - start) / runs
 
 
+rules = [
+    RewriteRule(
+        name="linear_relu",
+        pattern=[nn.Linear, nn.ReLU],
+        replacement=FusedLinearReLU
+    ),
+    RewriteRule(
+        name="linear_sigmoid",
+        pattern=[nn.Linear, nn.Sigmoid],
+        replacement=FusedLinearSigmoid
+    ),
+]
+
+
 model = Model()
-model.eval() # TO DEAL with DROPOUT!
+model.eval()  # needed because Dropout is random during training mode
+
 traced = symbolic_trace(model)
 
 print("BEFORE GRAPH:")
@@ -128,29 +191,30 @@ x = torch.randn(512, 4)
 
 original_output = traced(x)
 
-fused_traced = fuse_linear_relu(traced)
+rewritten_traced = apply_rewrite_rules(traced, rules)
 
 print("\nAFTER GRAPH:")
-print(fused_traced.graph)
+print(rewritten_traced.graph)
 
-fused_output = fused_traced(x)
+rewritten_output = rewritten_traced(x)
 
 print("\nOUTPUT SHAPES:")
-print("Original output shape:", original_output.shape)
-print("Fused output shape:   ", fused_output.shape)
+print("Original output shape: ", original_output.shape)
+print("Rewritten output shape:", rewritten_output.shape)
 
 print("\nOUTPUT CHECK:")
-print("Outputs close:", torch.allclose(original_output, fused_output, atol=1e-6))
+print("Outputs close:", torch.allclose(original_output, rewritten_output, atol=1e-6))
 
-print("\nMODULES AFTER FUSION:")
-for name, module in fused_traced.named_modules():
+print("\nMODULES AFTER REWRITE:")
+for name, module in rewritten_traced.named_modules():
     if name != "":
         print(name, "->", module.__class__.__name__)
 
 original_time = benchmark(traced, x)
-fused_time = benchmark(fused_traced, x)
+rewritten_time = benchmark(rewritten_traced, x)
 
 print("\nBENCHMARK:")
-print("Original FX avg time:", original_time)
-print("Fused FX avg time:   ", fused_time)
-print("Speedup:", original_time / fused_time)
+print("Original FX avg time: ", original_time)
+print("Rewritten FX avg time:", rewritten_time)
+print("Speedup:", original_time / rewritten_time)
+```
