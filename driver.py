@@ -101,6 +101,7 @@ def fuse_linear_relu(traced):
 
 
 model = Model()
+model.eval() # TO DEAL with DROPOUT!
 traced = symbolic_trace(model)
 
 print("BEFORE GRAPH:")
