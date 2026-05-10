@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.fx import symbolic_trace
+import time
 
 
 class Model(nn.Module):
@@ -99,6 +100,22 @@ def fuse_linear_relu(traced):
 
     return traced
 
+def benchmark(model, x, runs=1000):
+    model.eval()
+
+    # warmup
+    for _ in range(50):
+        model(x)
+
+    start = time.perf_counter()
+
+    for _ in range(runs):
+        model(x)
+
+    end = time.perf_counter()
+
+    return (end - start) / runs
+
 
 model = Model()
 model.eval() # TO DEAL with DROPOUT!
@@ -129,3 +146,11 @@ print("\nMODULES AFTER FUSION:")
 for name, module in fused_traced.named_modules():
     if name != "":
         print(name, "->", module.__class__.__name__)
+
+original_time = benchmark(traced, x)
+fused_time = benchmark(fused_traced, x)
+
+print("\nBENCHMARK:")
+print("Original FX avg time:", original_time)
+print("Fused FX avg time:   ", fused_time)
+print("Speedup:", original_time / fused_time)
