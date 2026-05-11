@@ -1,4 +1,3 @@
-```python
 import torch
 import torch.nn as nn
 from torch.fx import symbolic_trace
@@ -37,27 +36,18 @@ class Model(nn.Module):
         x = self.dropout(x)
 
         x = self.linear4(x)
+
         return x
 
 
-class FusedLinearReLU(nn.Module):
-    def __init__(self, linear, relu):
+# generic fusion block
+class SequentialFusion(nn.Module):
+    def __init__(self, *modules):
         super().__init__()
-        self.linear = linear
-        self.relu = relu
+        self.layers = nn.Sequential(*modules)
 
     def forward(self, x):
-        return self.relu(self.linear(x))
-
-
-class FusedLinearSigmoid(nn.Module):
-    def __init__(self, linear, sigmoid):
-        super().__init__()
-        self.linear = linear
-        self.sigmoid = sigmoid
-
-    def forward(self, x):
-        return self.sigmoid(self.linear(x))
+        return self.layers(x)
 
 
 class RewriteRule:
@@ -72,6 +62,7 @@ def is_module_type(node, traced, module_type):
         return False
 
     module = dict(traced.named_modules())[node.target]
+
     return isinstance(module, module_type)
 
 
@@ -85,6 +76,7 @@ def matches_pattern(nodes, start, traced, pattern):
         if not is_module_type(node, traced, module_type):
             return False
 
+        # verify graph connectivity
         if offset > 0:
             prev_node = nodes[start + offset - 1]
 
@@ -96,36 +88,52 @@ def matches_pattern(nodes, start, traced, pattern):
 
 def apply_rewrite_rules(traced, rules):
     graph = traced.graph
-    fusion_count = 0
 
+    fusion_count = 0
     changed = True
 
     while changed:
         changed = False
+
         modules = dict(traced.named_modules())
         nodes = list(graph.nodes)
 
         for rule in rules:
+
             for i in range(len(nodes)):
-                if not matches_pattern(nodes, i, traced, rule.pattern):
+
+                if not matches_pattern(
+                    nodes,
+                    i,
+                    traced,
+                    rule.pattern
+                ):
                     continue
 
                 matched_nodes = nodes[i:i + len(rule.pattern)]
+
                 first_node = matched_nodes[0]
                 last_node = matched_nodes[-1]
-
-                fusion_count += 1
-                fused_name = f"fused_{rule.name}_{fusion_count}"
 
                 old_modules = [
                     modules[node.target]
                     for node in matched_nodes
                 ]
 
+                fusion_count += 1
+
+                fused_name = f"fused_{rule.name}_{fusion_count}"
+
+                # dynamically create fusion block
                 fused_module = rule.replacement(*old_modules)
-                traced.add_module(fused_name, fused_module)
+
+                traced.add_module(
+                    fused_name,
+                    fused_module
+                )
 
                 with graph.inserting_after(last_node):
+
                     fused_node = graph.call_module(
                         fused_name,
                         args=first_node.args
@@ -166,21 +174,33 @@ def benchmark(model, x, runs=1000):
 
 
 rules = [
+
     RewriteRule(
         name="linear_relu",
         pattern=[nn.Linear, nn.ReLU],
-        replacement=FusedLinearReLU
+        replacement=SequentialFusion
     ),
+
     RewriteRule(
         name="linear_sigmoid",
         pattern=[nn.Linear, nn.Sigmoid],
-        replacement=FusedLinearSigmoid
+        replacement=SequentialFusion
+    ),
+
+    RewriteRule(
+        name="linear_bn_relu",
+        pattern=[
+            nn.Linear,
+            nn.BatchNorm1d,
+            nn.ReLU
+        ],
+        replacement=SequentialFusion
     ),
 ]
 
 
 model = Model()
-model.eval()  # needed because Dropout is random during training mode
+model.eval()
 
 traced = symbolic_trace(model)
 
@@ -191,30 +211,53 @@ x = torch.randn(512, 4)
 
 original_output = traced(x)
 
-rewritten_traced = apply_rewrite_rules(traced, rules)
+rewritten_traced = apply_rewrite_rules(
+    traced,
+    rules
+)
 
 print("\nAFTER GRAPH:")
 print(rewritten_traced.graph)
 
 rewritten_output = rewritten_traced(x)
 
-print("\nOUTPUT SHAPES:")
-print("Original output shape: ", original_output.shape)
-print("Rewritten output shape:", rewritten_output.shape)
-
 print("\nOUTPUT CHECK:")
-print("Outputs close:", torch.allclose(original_output, rewritten_output, atol=1e-6))
+print(
+    torch.allclose(
+        original_output,
+        rewritten_output,
+        atol=1e-6
+    )
+)
 
 print("\nMODULES AFTER REWRITE:")
+
 for name, module in rewritten_traced.named_modules():
+
     if name != "":
         print(name, "->", module.__class__.__name__)
 
-original_time = benchmark(traced, x)
-rewritten_time = benchmark(rewritten_traced, x)
+
+print("\nNODE COUNTS:")
+
+before_nodes = len(list(symbolic_trace(model).graph.nodes))
+after_nodes = len(list(rewritten_traced.graph.nodes))
+
+print("Before:", before_nodes)
+print("After: ", after_nodes)
+
+
+original_time = benchmark(
+    symbolic_trace(model),
+    x
+)
+
+rewritten_time = benchmark(
+    rewritten_traced,
+    x
+)
 
 print("\nBENCHMARK:")
 print("Original FX avg time: ", original_time)
 print("Rewritten FX avg time:", rewritten_time)
 print("Speedup:", original_time / rewritten_time)
-```
