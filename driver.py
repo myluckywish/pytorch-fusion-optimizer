@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from torch.fx import symbolic_trace
 import time
-
+import tracemalloc
 
 class Model(nn.Module):
     def __init__(self):
@@ -172,7 +172,19 @@ def benchmark(model, x, runs=1000):
 
     return (end - start) / runs
 
+def measure_memory(model, x):
+    model.eval()
 
+    tracemalloc.start()
+
+    model(x)
+
+    current, peak = tracemalloc.get_traced_memory()
+
+    tracemalloc.stop()
+
+    return peak / 1024
+    
 rules = [
 
     RewriteRule(
@@ -261,3 +273,18 @@ print("\nBENCHMARK:")
 print("Original FX avg time: ", original_time)
 print("Rewritten FX avg time:", rewritten_time)
 print("Speedup:", original_time / rewritten_time)
+
+original_memory = measure_memory(
+    symbolic_trace(model),
+    x
+)
+
+rewritten_memory = measure_memory(
+    rewritten_traced,
+    x
+)
+
+print("\nMEMORY:")
+print("Original FX peak memory KB: ", original_memory)
+print("Rewritten FX peak memory KB:", rewritten_memory)
+print("Memory ratio:", original_memory / rewritten_memory)
