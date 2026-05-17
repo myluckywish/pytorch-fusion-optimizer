@@ -36,12 +36,18 @@ transform = transforms.Compose([
     transforms.ToTensor()
 ])
 
-#
-#test_loader = DataLoader(
-#    test_dataset,
-#    batch_size=512,
-#    shuffle=False
-#)
+test_dataset = datasets.CIFAR10(
+    root="cifar",
+    train=False,
+    download=True,
+    transform=transform
+)
+
+test_loader = DataLoader(
+    test_dataset,
+    batch_size=512,
+    shuffle=False
+)
 
 x, y = next(iter(test_loader))
 
@@ -60,11 +66,21 @@ rewritten_traced = apply_rewrite_rules(
 rewritten_output = rewritten_traced(x)
 
 print("\nCIFAR OUTPUT CHECK:")
-print(torch.allclose(original_output, rewritten_output, atol=1e-5))
+print(
+    torch.allclose(
+        original_output,
+        rewritten_output,
+        atol=1e-5
+    )
+)
 
 print("\nCIFAR NODE COUNTS:")
-print("Before:", len(list(symbolic_trace(model).graph.nodes)))
-print("After: ", len(list(rewritten_traced.graph.nodes)))
+
+before_nodes = len(list(symbolic_trace(model).graph.nodes))
+after_nodes = len(list(rewritten_traced.graph.nodes))
+
+print("Before:", before_nodes)
+print("After: ", after_nodes)
 
 original_time = benchmark(
     symbolic_trace(model),
